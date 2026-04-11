@@ -7,134 +7,163 @@ import torch.optim as optim
 from flask import Flask, request, jsonify
 import numpy as np
 import os
-import pandas as pd
 import time
+import signal
+import sys
 
-if not os.path.exists('plots'):
-    os.makedirs('plots')
+if not os.path.exists('plots'): os.makedirs('plots')
 
 app = Flask(__name__)
 
 # --- CONFIG ---
-STATE_DIM = 9   # Added 1 for the 'Ground Detector' sensor
+STATE_DIM = 10  
 ACTION_DIM = 4  
-LR = 0.0003
-UPDATE_INTERVAL = 128 
-SUCCESS_REWARD = 1000.0 
-CRASH_PENALTY = -500.0 # High penalty for hitting walls/trees/river
-STAGNATION_THRESHOLD = 60 
-TIME_LIMIT = 120 
+LR = 0.00025     
+GAMMA = 0.99    
+GAE_LAMBDA = 0.95 
+PPO_CLIP = 0.2    
+ENTROPY_COEFF = 0.02 
+UPDATE_INTERVAL = 1024 
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "jeep_model.pth") 
 
-class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super(ActorCritic, self).__init__()
+class PPOBrain(nn.Module):
+    def __init__(self):
+        super(PPOBrain, self).__init__()
         self.fc = nn.Sequential(
-            nn.Linear(state_dim, 256), nn.ReLU(),
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, 64), nn.ReLU()
+            nn.Linear(STATE_DIM, 256), nn.ReLU(),
+            nn.Linear(256, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU()
         )
-        self.actor = nn.Linear(64, action_dim)
-        self.critic = nn.Linear(64, 1)
+        self.actor = nn.Linear(128, ACTION_DIM)
+        self.critic = nn.Linear(128, 1)
 
-    def forward(self, state):
-        x = self.fc(state)
-        return torch.softmax(self.actor(x), dim=-1), self.critic(x)
+    def forward(self, x):
+        features = self.fc(x)
+        return torch.softmax(self.actor(features), dim=-1), self.critic(features)
 
 device = torch.device("cpu")
-model = ActorCritic(STATE_DIM, ACTION_DIM).to(device)
+model = PPOBrain().to(device)
 optimizer = optim.Adam(model.parameters(), lr=LR)
 mse_loss = nn.MSELoss()
 
-# Buffers
-states_mem, actions_mem, rewards_mem, log_probs_mem, values_mem = [], [], [], [], []
-episode_history = []
-current_episode_reward = 0
-total_steps = 0
-last_dist = 9999
-episode_start_time = time.time()
-no_progress_steps = 0
+def save_checkpoint(steps):
+    checkpoint = {'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'total_steps': steps, 'state_dim': STATE_DIM}
+    torch.save(checkpoint, MODEL_PATH)
+    print(f"✅ Brain Saved at step {steps}")
 
-def plot_rewards():
-    try:
-        plt.figure(figsize=(10, 5))
-        plt.plot(episode_history, color='tab:red', alpha=0.4)
-        if len(episode_history) > 5:
-            avg = pd.Series(episode_history).rolling(window=10).mean()
-            plt.plot(avg, color='black', linewidth=2)
-        plt.title("Obstacle Avoidance Training")
-        plt.savefig('plots/training_progress.png')
-        plt.close('all')
-    except: pass
+def load_checkpoint():
+    if os.path.exists(MODEL_PATH):
+        try:
+            checkpoint = torch.load(MODEL_PATH)
+            if checkpoint.get('state_dim', 0) == STATE_DIM:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print("🚀 Brain Loaded Successfully")
+                return checkpoint.get('total_steps', 0)
+            else:
+                print("⚠️ Dimension mismatch in file. Starting fresh.")
+        except: print("⚠️ Could not load. Starting fresh.")
+    return 0
+
+def signal_handler(sig, frame):
+    save_checkpoint(total_steps)
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+total_steps = load_checkpoint()
+
+states, actions, rewards, log_probs, is_terminals, values = [], [], [], [], [], []
+last_dist, current_ep_reward = 0, 0
+last_move_time = time.time()
+episode_history = []
 
 def train():
-    global states_mem, actions_mem, rewards_mem, log_probs_mem, values_mem
-    if len(states_mem) < 10: return
-    S = torch.stack(states_mem)
-    A = torch.tensor(actions_mem).unsqueeze(1)
-    R = torch.tensor(rewards_mem).unsqueeze(1)
-    LP = torch.stack(log_probs_mem).detach()
-    V = torch.stack(values_mem).detach()
-    R_norm = (R - R.mean()) / (R.std() + 1e-5)
-    advantages = (R_norm - V).detach()
-    for _ in range(4):
-        probs, val = model(S)
+    global states, actions, rewards, log_probs, is_terminals, values
+    if len(states) < UPDATE_INTERVAL: return
+    S = torch.stack(states).to(device)
+    A = torch.tensor(actions).to(device).unsqueeze(1)
+    LP = torch.stack(log_probs).detach().to(device)
+    V = torch.stack(values).detach().to(device) 
+    R = torch.tensor(rewards).to(device).float()
+    Mask = torch.tensor([0 if m else 1 for m in is_terminals]).to(device)
+    returns, adv, last_gae = torch.zeros_like(R), torch.zeros_like(R), 0
+    for t in reversed(range(len(R))):
+        next_val = 0 if t == len(R) - 1 else V[t+1]
+        delta = R[t] + GAMMA * next_val * Mask[t] - V[t]
+        adv[t] = last_gae = delta + GAMMA * GAE_LAMBDA * Mask[t] * last_gae
+        returns[t] = adv[t] + V[t]
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+    for _ in range(5):
+        probs, v_curr = model(S)
         dist = torch.distributions.Categorical(probs)
         new_lp = dist.log_prob(A.squeeze()).unsqueeze(1)
         ratio = torch.exp(new_lp - LP)
-        surr1, surr2 = ratio * advantages, torch.clamp(ratio, 0.8, 1.2) * advantages
-        policy_loss, value_loss = -torch.min(surr1, surr2).mean(), mse_loss(val, R_norm)
-        optimizer.zero_grad()
-        (policy_loss + 0.5 * value_loss).backward()
-        optimizer.step()
-    states_mem, actions_mem, rewards_mem, log_probs_mem, values_mem = [], [], [], [], []
+        surr1 = ratio * adv.unsqueeze(1)
+        surr2 = torch.clamp(ratio, 1.0 - PPO_CLIP, 1.0 + PPO_CLIP) * adv.unsqueeze(1)
+        loss = -torch.min(surr1, surr2).mean() + 0.5 * mse_loss(v_curr, returns.unsqueeze(1)) - ENTROPY_COEFF * dist.entropy().mean()
+        optimizer.zero_grad(); loss.backward(); optimizer.step()
+    states[:], actions[:], rewards[:], log_probs[:], is_terminals[:], values[:] = [], [], [], [], [], []
+    save_checkpoint(total_steps)
 
 @app.route('/act', methods=['POST'])
 def act():
-    global current_episode_reward, total_steps, last_dist, episode_start_time, no_progress_steps
+    global last_dist, total_steps, current_ep_reward, last_move_time
     try:
         data = request.json
+        sensors = data.get('sensors', [60]*6)
+        # Handle cases where sensors might be missing
+        while len(sensors) < 6: sensors.append(0)
+        
         d, a, s = data['distance'], data['angle'], data['speed']
-        is_collision = data.get('collision', False)
+        lvl, is_collision = data['level'], data.get('collision', False)
+
+        current_time = time.time()
+        if s > 2.0: last_move_time = current_time
+        is_stuck = (current_time - last_move_time) > 15.0
+
+        if last_dist == 0: last_dist = d
+        progress = (last_dist - d)
         
-        # 1. Termination Checks
-        elapsed = time.time() - episode_start_time
-        progress = last_dist - d
-        if progress < 0.1: no_progress_steps += 1
-        else: no_progress_steps = 0
+        reward = -0.01 + (progress * 0.6) + (a * 0.15) 
+
+        done = False
+        if d < 15: 
+            reward += 15.0
+            done = True
+            print(f"✨ Level {lvl} Success!")
+        elif is_collision or sensors[5] < 3.0 or is_stuck: 
+            reward -= 10.0
+            done = True
+            print(f"💥 Failure at Level {lvl}")
+
+        # Construct 10D State: 6 sensors + dist + angle + speed + level
+        state_list = [*([v/60.0 for v in sensors[:6]]), d/1500.0, a, s/100.0, lvl/20.0]
+        state_t = torch.FloatTensor(state_list).to(device)
         
-        is_success = d < 12
-        is_failed = is_collision or (elapsed > TIME_LIMIT) or (no_progress_steps > STAGNATION_THRESHOLD)
-        
-        # 2. Reward Shaping
-        step_reward = (a * 6.0) + (progress * 20.0) + (s * 0.2) - 1.5 
-        if is_success: step_reward += SUCCESS_REWARD
-        if is_collision: step_reward += CRASH_PENALTY # Massive hit for trees/river/walls
-            
-        current_episode_reward += step_reward
-        last_dist = d
+        with torch.no_grad():
+            probs, val = model(state_t)
+            dist = torch.distributions.Categorical(probs)
+            action = dist.sample()
 
-        # 3. Decision
-        state_t = torch.FloatTensor([*data['sensors'], d/100, a, s/50]).to(device)
-        probs, val = model(state_t)
-        action = torch.distributions.Categorical(probs).sample()
+        states.append(state_t); actions.append(action.item()); rewards.append(reward)
+        log_probs.append(dist.log_prob(action)); is_terminals.append(done); values.append(val.squeeze()) 
 
-        states_mem.append(state_t)
-        actions_mem.append(action.item())
-        rewards_mem.append(step_reward)
-        log_probs_mem.append(torch.distributions.Categorical(probs).log_prob(action))
-        values_mem.append(val)
-
-        if is_success or is_failed:
-            episode_history.append(current_episode_reward)
-            current_episode_reward, last_dist, no_progress_steps = 0, 9999, 0
-            episode_start_time = time.time()
-            plot_rewards()
-
+        current_ep_reward += reward
+        last_dist = 0 if done else d
         total_steps += 1
-        if total_steps % UPDATE_INTERVAL == 0: train()
-        return jsonify({"action": action.item(), "reset": (is_success or is_failed)})
-    except:
-        return jsonify({"action": 3, "reset": False})
+        
+        if done:
+            episode_history.append(current_ep_reward)
+            current_ep_reward = 0
+            last_move_time = time.time()
+            if len(episode_history) % 10 == 0:
+                plt.figure(); plt.plot(episode_history); plt.savefig('plots/progress.png'); plt.close()
+
+        if len(states) >= UPDATE_INTERVAL: train()
+        return jsonify({"action": action.item(), "reset": done})
+    except Exception as e:
+        print(f"⚠️ Error: {e}")
+        return jsonify({"action": 3, "reset": True})
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5000)
+    app.run(host='127.0.0.1', port=5000, threaded=False)
