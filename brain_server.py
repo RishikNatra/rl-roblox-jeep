@@ -155,10 +155,17 @@ def act():
         
         with brain_lock:
             if env_id not in env_states:
-                env_states[env_id] = {'last_dist': 0, 'current_ep_reward': 0, 'last_move_time': time.time()}
+                env_states[env_id] = {
+                    'last_dist': 0, 
+                    'current_ep_reward': 0, 
+                    'last_move_time': time.time(),
+                    'start_time': time.time(),
+                    'off_path_since': None,
+                    'flipped_since': None
+                }
             
-            sensors = data.get('sensors', [60]*6)
-            while len(sensors) < 6: sensors.append(0)
+            sensors = data.get('sensors', [])
+            while len(sensors) < 6: sensors.append(60.0)
             
             d, a, s = data['distance'], data['angle'], data['speed']
             lvl, is_collision = data['level'], data.get('collision', False)
@@ -172,6 +179,26 @@ def act():
 
             if e_state['last_dist'] == 0: e_state['last_dist'] = d
             progress = max(0, e_state['last_dist'] - d)
+            
+            # Timeout (1 min)
+            is_timeout = (current_time - e_state['start_time']) > 60.0
+            
+            # Off path tracking (> 10s)
+            if g_dist > 10.0:
+                if e_state['off_path_since'] is None:
+                    e_state['off_path_since'] = current_time
+            else:
+                e_state['off_path_since'] = None
+            is_off_path_long = e_state['off_path_since'] is not None and (current_time - e_state['off_path_since']) > 10.0
+            
+            # Flipped tracking (> 10s)
+            is_flipped = data.get('flipped', False)
+            if is_flipped:
+                if e_state['flipped_since'] is None:
+                    e_state['flipped_since'] = current_time
+            else:
+                e_state['flipped_since'] = None
+            is_flipped_long = e_state['flipped_since'] is not None and (current_time - e_state['flipped_since']) > 10.0
             
             # --- Better Reward Shaping ---
             direction_reward = a if a > 0 else a * 2.0 
@@ -196,14 +223,31 @@ def act():
                 done = True
                 is_success = True
                 print(f"✨ [{env_id}] Level {lvl} Success!")
-            elif g_dist > 250:
+            elif is_off_path_long:
                 reward -= 15.0
                 done = True
-                print(f"🚫 [{env_id}] Resetting... (Off-Path: {g_dist:.1f})")
+                print(f"🚫 [{env_id}] Resetting... (Off-Path > 10s)")
+            elif is_flipped_long:
+                reward -= 15.0
+                done = True
+                print(f"💥 [{env_id}] Resetting... (Flipped > 10s)")
+            elif is_timeout:
+                reward -= 15.0
+                done = True
+                print(f"⏰ [{env_id}] Timeout - Over 1 minute")
             elif is_collision or sensors[5] < 3.0 or is_stuck: 
                 reward -= 15.0
                 done = True
-                print(f"💥 [{env_id}] Failure at Level {lvl} (Dist: {d:.1f})")
+                
+                # Help debugging if it's sensor-based, physical collision, or stuck
+                if is_stuck:
+                    stuck_text = "Stuck"
+                elif is_collision:
+                    stuck_text = "Collision"
+                else:
+                    stuck_text = f"Sensor[5] hit <3.0 ({sensors[5]:.1f})"
+                    
+                print(f"💥 [{env_id}] Failure ({stuck_text}) at Level {lvl} (Dist: {d:.1f})")
 
             # Construct 11D State: 6 sensors + dist + g_dist + angle + speed + level
             state_list = [
@@ -235,6 +279,9 @@ def act():
                 
                 e_state['current_ep_reward'] = 0
                 e_state['last_move_time'] = time.time()
+                e_state['start_time'] = time.time()
+                e_state['off_path_since'] = None
+                e_state['flipped_since'] = None
                 
                 if len(episode_history) % 10 == 0:
                     plt.figure(figsize=(15, 10))
