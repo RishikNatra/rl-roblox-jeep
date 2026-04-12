@@ -204,11 +204,14 @@ def act():
             direction_reward = a if a > 0 else a * 2.0 
             speed_efficiency = (s / 100.0) * a 
             
+            # High reward for staying extremely close to the guide part
+            guide_reward = 2.0 / (g_dist + 1.0)  # Yields +2.0 when dead-centered, drops as it strays
+            
             path_penalty = 0
             if g_dist > 5.0:
-                path_penalty = (g_dist - 5.0) * 0.05
+                path_penalty = (g_dist - 5.0) * 0.15
                 
-            reward = -0.05 + (progress * 1.5) + (direction_reward * 0.5) + (speed_efficiency * 1.0) - path_penalty
+            reward = -0.05 + (progress * 1.5) + (direction_reward * 0.5) + (speed_efficiency * 1.0) + guide_reward - path_penalty
             
             if e_state['last_dist'] > 0:
                 reward += (e_state['last_dist'] - d) * 0.8
